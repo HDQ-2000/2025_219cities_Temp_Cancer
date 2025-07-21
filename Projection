@@ -1,0 +1,249 @@
+################################################################################
+## R code for an example of the projection analysis in:
+## "Cancer Mortality Associated with Ambient Temperature 
+## in China Under Climate Change: A Nationwide Modelling Study"
+##
+################################################################################
+
+
+setwd("C:/XXX/temp_cancer/projection")
+
+
+################################################################################
+#### load the data
+################################################################################
+obs <- fread("C:/XXX/data.csv")  ## observation data
+future <- fread("C:/XXX/future.csv.gz")  ## projected daily mean temperature series
+city_models <- readRDS("C:/XXX/city_models.rds") ## city-specific models and results obtained in the baseline analysis
+
+
+
+################################################################################
+## projection function
+################################################################################
+analyze_city <- function(city_data, future_data, city_name, city_models, nsim = 1000) {
+  
+  message("\nProcessing city: ", city_name)
+  
+  cen <- city_models[[city_name]]$cen
+  maxlag <- 14
+  
+  argvar <- list(fun = "ns", 
+                 knots = quantile(city_data$tm, c(0.1, 0.75, 0.9), na.rm = TRUE),
+                 Bound = quantile(city_data$tm, c(0.01, 0.99), na.rm = TRUE))
+  
+  cb <- crossbasis(city_data$tm, lag = maxlag, argvar = argvar, 
+                   arglag = arglag, na.action = "na.exclude")
+  
+  city_data <- city_data[order(city_data$date), ]
+  
+  model <- glm(total ~ cb + dow + ns(rhu, 3) +
+                 ns(t, df = round(length(unique(data$year)))*dftrend),
+               data, family = quasipoisson, na.action = "na.exclude")
+  
+  red <- crossreduce(cb, m, cen = cen)
+  coef <- coef(red)
+  vcov <- vcov(red)
+  
+  # define projected mortality series
+  death_doy <- city_data %>%
+    mutate(doy = as.numeric(format(date, "%j"))) %>%
+    group_by(doy) %>%
+    summarise(avg_death = mean(total, na.rm = TRUE)) %>%
+    complete(doy = 1:365, fill = list(avg_death = mean(.$avg_death, na.rm = TRUE))) %>%
+    pull(avg_death)
+  
+  future_dates <- seq(min(future_data$date), max(future_data$date), by = "day")
+  future_doy <- as.numeric(format(future_dates, "%j"))
+  future_doy[future_doy == 366] <- 365
+  
+  death_proj <- death_doy[future_doy]
+  
+  # define periods of baseline and projected
+  base_period <- "2010-2019"
+  proj_periods <- paste0(seq(2020, 2090, by = 10), "-", seq(2029, 2099, by = 10))
+  all_periods <- c(base_period, proj_periods)
+  
+  year_num <- as.numeric(format(future_dates, "%Y"))
+  period_labels <- cut(
+    year_num,
+    breaks = c(2010, 2020, 2030, 2040, 2050, 2060, 2070, 2080, 2090, 2100),
+    labels = all_periods,
+    right = FALSE
+  )
+  
+  # store the results
+  ssps <- unique(future_data$ssp)
+  models <- unique(future_data$model)
+  
+  result_dim <- c(
+    length(ssps),
+    length(models),
+    length(all_periods),
+    2,  # abs & rel
+    9,  # AN_total, AN_cold, AN_heat, AF_total, AF_cold, AF_heat, total_death, cold_death, heat_death
+    3   # estimates and 95% eCls
+  )
+  
+  result_array <- array(
+    NA,
+    dim = result_dim,
+    dimnames = list(
+      ssps,
+      models,
+      all_periods,
+      c("abs", "rel"),
+      c("AN_total", "AN_cold", "AN_heat", 
+        "AF_total", "AF_cold", "AF_heat", 
+        "total_death", "cold_death", "heat_death"),
+      c("est", "ci_low", "ci_high")
+    )
+  )
+  
+  # loop
+  pb <- progress_bar$new(
+    format = paste0(" ", city_name, " :ssp :model [:bar] :percent eta: :eta"),
+    total = length(ssps) * length(models),
+    clear = FALSE
+  )
+  
+  for (i in seq_along(ssps)) {
+    for (j in seq_along(models)) {
+      pb$tick(tokens = list(ssp = ssps[i], model = models[j]))
+      
+      temp_data <- future_data %>%
+        filter(ssp == ssps[i], model == models[j]) %>%
+        pull(tm)
+      
+      valid_length <- min(length(temp_data), length(death_proj), length(period_labels))
+      temp_data <- temp_data[1:valid_length]
+      death_proj_sub <- death_proj[1:valid_length]
+      period_labels_sub <- period_labels[1:valid_length]
+      
+      tryCatch({
+        
+        bvar <- do.call(onebasis, c(list(x = temp_data), argvar))
+        cen_vec <- do.call(onebasis, c(list(x = cen), argvar))
+        bvar_cen <- scale(bvar, center = cen_vec, scale = FALSE)
+        
+        ind_heat <- temp_data > cen
+        
+        an <- (1 - exp(-bvar_cen %*% coef)) * death_proj_sub
+        
+        an_abs_total <- tapply(an, period_labels_sub, sum, na.rm = TRUE)[all_periods]
+        an_abs_cold <- tapply(an[!ind_heat], period_labels_sub[!ind_heat], sum, na.rm = TRUE)[all_periods]
+        an_abs_heat <- tapply(an[ind_heat], period_labels[ind_heat], sum, na.rm = TRUE)[all_periods]
+        
+        total_death <- tapply(death_proj_sub, period_labels_sub, sum, na.rm = TRUE)[all_periods]
+        cold_death <- tapply(death_proj_sub[!ind_heat], period_labels_sub[!ind_heat], sum, na.rm = TRUE)[all_periods]
+        heat_death <- tapply(death_proj_sub[ind_heat], period_labels_sub[ind_heat], sum, na.rm = TRUE)[all_periods]
+        
+        af_total <- ifelse(total_death > 0, an_abs_total / total_death * 100, NA)
+        af_cold <- ifelse(total_death > 0, an_abs_cold / total_death * 100, NA)
+        af_heat <- ifelse(total_death > 0, an_abs_heat / total_death * 100, NA)
+        
+        set.seed(123 + i * 100 + j)
+        coef_sim <- mvrnorm(nsim, coef, vcov)
+        
+        sim_abs <- list(
+          AN_total = matrix(NA, nrow = length(all_periods), ncol = nsim),
+          AN_cold = matrix(NA, nrow = length(all_periods), ncol = nsim),
+          AN_heat = matrix(NA, nrow = length(all_periods), ncol = nsim),
+          
+          AF_total = matrix(NA, nrow = length(all_periods), ncol = nsim),
+          AF_cold = matrix(NA, nrow = length(all_periods), ncol = nsim),
+          AF_heat = matrix(NA, nrow = length(all_periods), ncol = nsim),
+          
+          total_death = matrix(NA, nrow = length(all_periods), ncol = nsim),
+          cold_death = matrix(NA, nrow = length(all_periods), ncol = nsim),
+          heat_death = matrix(NA, nrow = length(all_periods), ncol = nsim)
+        )
+        
+        for (s in 1:nsim) {
+          an_sim <- (1 - exp(-bvar_cen %*% coef_sim[s, ])) * death_proj_sub
+          
+          sim_abs$AN_total[,s] <- tapply(an_sim, period_labels_sub, sum, na.rm = TRUE)[all_periods]
+          sim_abs$AN_cold[,s] <- tapply(an_sim[!ind_heat], period_labels_sub[!ind_heat], sum, na.rm = TRUE)[all_periods]
+          sim_abs$AN_heat[,s] <- tapply(an_sim[ind_heat], period_labels_sub[ind_heat], sum, na.rm = TRUE)[all_periods]
+          
+          sim_abs$AF_total[,s] <- ifelse(total_death > 0, sim_abs$AN_total[,s] / total_death * 100, NA)
+          sim_abs$AF_cold[,s] <- ifelse(total_death > 0, sim_abs$AN_cold[,s] / total_death * 100, NA)
+          sim_abs$AF_heat[,s] <- ifelse(total_death > 0, sim_abs$AN_heat[,s] / total_death * 100, NA)
+          
+          sim_abs$total_death[,s] <- total_death
+          sim_abs$cold_death[,s] <- cold_death
+          sim_abs$heat_death[,s] <- heat_death
+        }
+        
+        # estimates of abs
+        result_array[i, j, , "abs", "AN_total", "est"] <- an_abs_total
+        result_array[i, j, , "abs", "AN_cold", "est"] <- an_abs_cold
+        result_array[i, j, , "abs", "AN_heat", "est"] <- an_abs_heat
+        
+        result_array[i, j, , "abs", "AF_total", "est"] <- af_total
+        result_array[i, j, , "abs", "AF_cold", "est"] <- af_cold
+        result_array[i, j, , "abs", "AF_heat", "est"] <- af_heat
+        
+        # estimates of death
+        result_array[i, j, , "abs", "total_death", "est"] <- total_death
+        result_array[i, j, , "abs", "cold_death", "est"] <- cold_death
+        result_array[i, j, , "abs", "heat_death", "est"] <- heat_death
+        
+        # estimates of 95% eCI for abs
+        for (metric in c("AN_total", "AN_cold", "AN_heat", 
+                         "AF_total", "AF_cold", "AF_heat", 
+                         "total_death", "cold_death", "heat_death")) {
+          ci <- apply(sim_abs[[metric]], 1, quantile, 
+                      c(0.025, 0.975), na.rm = TRUE)
+          result_array[i, j, , "abs", metric, c("ci_low", "ci_high")] <- t(ci)
+        }
+        
+      }, error = function(e) {
+        message("\ncity ", city_name, " SSP", ssps[i], " model", models[j], " error：", e$message)
+        
+      })
+    }
+  }
+  
+  list(
+    city = city_name,
+    cen = cen,
+    results = result_array,
+    model_params = list(coef = coef, vcov = vcov)
+  )
+}
+
+
+
+################################################################################
+#### Run function code for projection
+################################################################################
+
+cities <- unique(obs$city)
+
+city_results <- list()
+model_params <- list()
+
+for (city in cities) {
+  tryCatch({
+    message("\nanalysis for：", city)
+    
+    city_obs <- obs %>% filter(city == !!city)
+    city_future <- future %>% filter(city == !!city)
+    
+    res <- analyze_city(
+      city_data = city_obs,
+      future_data = city_future,
+      city_name = city,
+      city_models = city_models,
+      nsim = 1000
+    )
+    
+    city_results[[city]] <- res
+    model_params[[city]] <- res$model_params
+    message("success in：", city)
+    
+  })
+}
+
+saveRDS(city_results, "C:/XXX/projection_results.rds")
