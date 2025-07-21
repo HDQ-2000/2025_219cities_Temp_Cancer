@@ -1,0 +1,263 @@
+################################################################################
+## R code for an example of the two-stage analysis in:
+## "Cancer Mortality Associated with Ambient Temperature 
+## in China Under Climate Change: A Nationwide Modelling Study"
+##
+################################################################################
+
+## load the pachages
+library(data.table);library(lubridate);library(dplyr);library(dlnm)
+library(splines);library(tsModel);library(forestplot);library(reshape2)
+library(mvmeta);library(metafor);library(ggthemes);library(ggsci);library(tidyr)
+
+setwd("C:/XXX/temp_cancer/baseline_analysis")
+
+
+################################################################################
+#### prepare the data
+################################################################################
+
+# load the data
+df <- fread("C:/XXX/data.csv")
+
+# day of the year (1:365)
+df$doy <- as.numeric(strftime(df$date, format = "%j"))
+
+# dow
+df$dow <- as.factor(wday(df$date))
+
+# arrange the data as a list of data sets
+city <- as.character(unique(df$city))
+dlist <- lapply(city, function(x) df[df$city==x,])
+names(dlist) <- city
+
+# parameters for the model
+varper <- c(10,75,90)
+lag <- 14
+lagnk <- 3
+arglag <- list(knots = logknots(lag, lagnk))
+dftrend <- 7
+
+
+################################################################################
+#### first-stage analysis: run the model in each city
+################################################################################
+
+# create the objects to store the results
+# coefficients and covariance for overall cumulative summary
+coef <- matrix(NA, length(city), 4, dimnames = list(city))
+vcov <- vector("list", length(city))
+names(vcov) <- city
+
+# run the loop
+time <- proc.time()[3]
+for (i in seq(length(dlist))) {
+  # print
+  cat(i,"")
+  # extract the data
+  data <- dlist[[i]]
+  
+  # order by date
+  data <- data[order(data$date),]
+  
+  # time
+  data$t = 1:dim(data)[1]
+  
+  argvar <- list(fun = "ns", knots = quantile(data$tm, varper/100, na.rm = T))
+  
+  cb <- crossbasis(data$tm, lag = lag, argvar = argvar, arglag = arglag)
+  
+  model <- glm(total ~ cb + dow + ns(rhu, 3) +
+                 ns(t, df = round(length(unique(data$year)))*dftrend),
+               data, family = quasipoisson, na.action = "na.exclude")
+  
+  # predict effects: extract from the model those parameters corresponding to
+  # cross-basis variables through functions coef and vcov
+  pred <- crosspred(cb, model)
+  
+  # reduction to overall cumulative
+  # sum the effects of all lags in order to eliminate one dimension of the association
+  # sum (accumulate) the risk during the lag period
+  red <- crossreduce(cb, model)
+  
+  # overall cumulative summary for the main model
+  coef[i,] <- coef(red)
+  vcov[[i]] <- vcov(red)
+}
+proc.time()[3]-time
+
+
+################################################################################
+#### second-stage analysis: multivariate meta-analysis
+################################################################################
+# create average temperature and range as meta-predictors
+avgtmean <- sapply(dlist, function(x) mean(x$tm, na.rm = T))
+rangetmean <- sapply(dlist, function(x) diff(range(x$tm, na.rm = T)))
+
+# meta-analysis
+city <- read.csv("city.csv")
+
+mv <- mvmeta(coef ~ 1, vcov, city, control = list(showiter = T))
+summary(mv)
+
+# obtain blups (best linear unbiased predictions)
+blup <- blup(mv, vcov = T)
+
+# re-centering
+# generate the matrix for storing the results
+minpercity <- mintempcity <- rep(NA, length(dlist))
+names(mintempcity) <- names(minpercity) <- city
+
+predper <- c(seq(0, 5, 0.1), 6:94, seq(95, 100, 0.1))
+tmeancountry <- rowMeans(sapply(dlist, function(x) 
+  quantile(jitter(x$tm),predper/100, na.rm = T)))
+
+# define minimum mortality values: exclude low and very hot temperature
+for (i in seq(length(dlist))) {
+  data <- dlist[[i]]
+  predvar <- quantile(data$tm, 1:99/100, na.rm = T)
+  # redefine the function using all the arguments (boundary knots included)
+  
+  argvar <- list(x = predvar, fun = "ns",
+                 knots = quantile(data$tm, varper/100, na.rm = T),
+                 Bound = range(data$tm, na.rm = T))
+  bvar <- do.call(onebasis, argvar)
+  
+  minpercity[i] <- (1:99)[which.min(bvar%*%blup[[i]]$blup)]
+  mintempcity[i] <- quantile(data$tm, minpercity[i]/100, na.rm = T)
+}
+
+
+# country-specific points of minimum mortality
+(minperccountry <- median(minpercity))
+(mintempcountry <- median(mintempcity))
+
+
+################################################################################
+#### predict the pooled overall cumulative associations
+################################################################################
+
+city_n <- as.character(unique(df$city))
+datanew <- data.frame(avgtmean = mean(tapply(avgtmean, city_n, mean)),
+                      rangetmean = mean(tapply(rangetmean, city_n, mean)))
+
+# predict the pooled coefficients
+mvpred <- predict(mv, datanew, vcov = T, format = "list")
+
+# define percentiles and related aberage temperatures
+# and a "jitter" to make percentiles unique (with seed)
+predper <- c(seq(0, 5, 0.1), 6:94, seq(95, 100, 0.1))
+set.seed(13041975)
+tmeancountry <- rowMeans(sapply(dlist, function(x) quantile(jitter(x$tm),
+                                                            predper/100, na.rm=T)))
+
+# define indicator for centering percentile from average association
+bvar <- onebasis(tmeancountry, fun = "ns", 
+                 knots = tmeancountry[paste(varper, ".0%", sep = "")])
+
+(cenindcountry <- which.min(bvar%*%mvpred$fit))
+# define centering percentile for country
+(cenpercountry <- pmin(pmax(predper[cenindcountry], 10), 90))
+
+# obtain the centered predictions
+(cen <- tmeancountry[paste(cenpercountry, ".0%", sep="")])
+cp <- crosspred(bvar, coef = mvpred$fit, vcov = mvpred$vcov, 
+                model.link = "log", at = tmeancountry, cen = cen)
+
+
+################################################################################
+#####  results for cumulative relative risks
+################################################################################
+
+# definitions of extremely low and extremely high temperatures
+(hight <- tmeancountry["97.5%"])
+(lowt <- tmeancountry["2.5%"])
+
+# rr
+results <- data.frame(hight = hight, lowt = lowt, cen = round(cp$cen, 1),
+                      heatrr = round(cp$allRRfit[as.character(hight)], 2),
+                      heatrrlow = round(cp$allRRlow[as.character(hight)], 2),
+                      heatrrhigh = round(cp$allRRhigh[as.character(hight)], 2),
+                      coldrr = round(cp$allRRfit[as.character(lowt)], 2),
+                      coldrrlow = round(cp$allRRlow[as.character(lowt)], 2),
+                      coldrrhigh = round(cp$allRRhigh[as.character(lowt)], 2))
+write.csv(results, "results.csv")
+
+
+################################################################################
+#### analyses of lag-response associations
+################################################################################
+
+coeflag_cold <- coeflag_heat <- matrix(NA, length(city), 4, dimnames = list(city))
+vcovlag_cold <- vcovlag_heat <- vector("list", length(city))
+names(vcovlag_cold) <-  names(vcovlag_heat) <- city
+
+## run the loop
+time <- proc.time()[3]
+for (i in seq(length(dlist))) {
+  # print
+  cat(i,"")
+  # extract the data
+  data <- dlist[[i]]
+  # time
+  data$t = 1:dim(data)[1]
+  
+  argvar <- list(fun = "ns", knots = quantile(data$tm, varper/100, na.rm = T))
+  
+  cb <- crossbasis(data$tm, lag = lag, argvar = argvar, arglag = arglag)
+  
+  model <- glm(total ~ cb + dow + ns(rhu, 3) +
+                 ns(t, df = round(length(unique(data$year)))*dftrend),
+               data, family = quasipoisson, na.action = "na.exclude")
+  
+  # predict effects: extract from the model those parameters corresponding to
+  # cross-basis variables through functions coef and vcov
+  pred <- crosspred(cb, model)
+  
+  # reduction to overall cumulative
+  # sum the effects of all lags in order to eliminate one dimension of the association
+  # sum (accumulate) the risk during the lag period
+  
+  hott <- round(quantile(data$tm, 0.975, na.rm = T), 1)
+  coldt <- round(quantile(data$tm, 0.025, na.rm = T), 1)
+  
+  # reduction to overall cumulative
+  # sum the effects of all lags in order to eliminate one dimension of the association
+  # sum (accumulate) the risk during the lag period
+  redlag_cold <- crossreduce(cb, model, "var", value = coldt, 
+                             cen = cen, model.link = "log")
+  redlag_heat <- crossreduce(cb, model, "var", value = hott, 
+                             cen = cen, model.link = "log")
+  
+  # overall cumulative summary for the main model
+  coeflag_cold[i,] <- coef(redlag_cold)
+  vcovlag_cold[[i]] <- vcov(redlag_cold)
+  coeflag_heat[i,] <- coef(redlag_heat)
+  vcovlag_heat[[i]] <- vcov(redlag_heat)
+}
+proc.time()[3]-time
+
+# predict pooled coefficients
+mvlag_cold <- mixmeta(coeflag_cold ~ 1, vcovlag_cold, method = "reml")
+mvlag_heat <- mixmeta(coeflag_heat ~ 1, vcovlag_heat, method = "reml")
+
+tmtot <- seq(range(df$tm)[1], range(df$tm)[2], length = 50)
+
+# cross-basis for lag
+cblag <- crossbasis(tmtot, lag = lag,
+                    argvar = list(fun = "ns", knots = quantile(data$tm, varper/100, na.rm = T)),
+                    arglag = arglag)
+
+lag1 <- lag*10
+xlag <- 0:lag1/10
+
+# obtain predictions for lag 0 to 'lmax'
+blag <- do.call(onebasis, c(list(x = xlag), attr(cb, "arglag")))
+
+# predict pooled lag-response associations for heat and cold
+cplag_cold <- crosspred(blag, coef = coef(mvlag_cold), 
+                        vcov = vcov(mvlag_cold),
+                        model.link = "log", bylag = 1, at = xlag)
+cplag_heat <- crosspred(blag, coef = coef(mvlag_heat), 
+                        vcov = vcov(mvlag_heat),
+                        model.link = "log", bylag = 1, at = xlag)
